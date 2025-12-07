@@ -2,20 +2,23 @@ from flask import Flask, render_template_string, jsonify
 from dateutil.parser import parse as parse_date
 import datetime
 import os
+import subprocess
+import re
 
-# Конфиг
+# Конфигурация
 LOG_FILE = '/opt/pet_temp/logs/temp_monitor.log'
-# Количество ротационных файлов
 BACKUP_COUNT = 5
-# Порт для Flask
-WEB_PORT = 8080  
+WEB_PORT = 8080
 
 app = Flask(__name__)
 
-def read_logs_last_30_days():
+def read_logs_last_7_days():
     logs = []
-    thirty_days_ago = datetime.datetime.now() - datetime.timedelta(days=30)
-    files_to_read = [LOG_FILE] + [f"{LOG_FILE}.{i}" for i in range(1, BACKUP_COUNT + 1) if os.path.exists(f"{LOG_FILE}.{i}")]
+    seven_days_ago = datetime.datetime.now() - datetime.timedelta(days=7)
+    files_to_read = [LOG_FILE] + [
+        f"{LOG_FILE}.{i}" for i in range(1, BACKUP_COUNT + 1)
+        if os.path.exists(f"{LOG_FILE}.{i}")
+    ]
     for file in files_to_read:
         if os.path.exists(file):
             with open(file, 'r') as f:
@@ -25,12 +28,32 @@ def read_logs_last_30_days():
                         if 'Temperature:' in message:
                             temp = float(message.split(': ')[1].split('°')[0])
                             timestamp = parse_date(timestamp_str)
-                            if timestamp >= thirty_days_ago:
-                                logs.append({'timestamp': timestamp.strftime('%d-%m %H:%M'), 'temp': temp})
-                    except:
+                            if timestamp >= seven_days_ago:
+                                logs.append({
+                                    'timestamp': timestamp.strftime('%d-%m %H:%M'),
+                                    'temp': temp
+                                })
+                    except Exception:
                         pass
-    # Сортируем по времени (ascending для графика)
-    return sorted(logs, key=lambda x: x['timestamp'])
+    # Сортировка по времени (по возрастанию)
+    return sorted(
+        logs,
+        key=lambda x: datetime.datetime.strptime(x['timestamp'], '%d-%m %H:%M')
+    )
+
+def get_current_temp():
+    try:
+        result = subprocess.run(['sensors'], capture_output=True, text=True, timeout=3)
+        if result.returncode != 0:
+            return None
+        # Ищем первую подходящую строку с температурой
+        for line in result.stdout.splitlines():
+            match = re.search(r'\+?(\d+\.\d+)[°\s]*C', line)
+            if match:
+                return float(match.group(1))
+        return None
+    except Exception:
+        return None
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -38,18 +61,21 @@ HTML_TEMPLATE = """
 <head>
     <title>Монитор температуры</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1"></script>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-100 font-sans">
     <div class="container mx-auto p-6">
-        <h1 class="text-3xl font-bold text-gray-800 mb-8 text-center">Монитор температуры (последние 30 дней)</h1>
-        <div class="bg-white p-8 rounded-lg shadow-lg">
+        <h1 class="text-3xl font-bold text-gray-800 mb-8 text-center">Монитор температуры (последние 7 дней)</h1>
+        <div class="bg-white p-8 rounded-lg shadow-lg mb-6">
             <canvas id="tempChart" class="w-full h-[500px]"></canvas>
         </div>
+        <div id="current-temp" class="text-center text-lg font-semibold text-gray-700">
+            Текущая температура: <span id="temp-value">–</span> °C
+        </div>
     </div>
+
     <script>
-        // Регистрируем плагин для тени
         Chart.register({
             id: 'dropshadow',
             beforeDraw: function(chart) {
@@ -61,6 +87,7 @@ HTML_TEMPLATE = """
             }
         });
 
+        // Загрузка исторических данных (7 дней)
         fetch('/data')
             .then(response => response.json())
             .then(data => {
@@ -76,11 +103,8 @@ HTML_TEMPLATE = """
                             backgroundColor: 'rgba(16, 185, 129, 0.2)',
                             fill: true,
                             tension: 0.4,
-                            pointBackgroundColor: '#047857',
-                            pointBorderColor: '#FFFFFF',
-                            pointBorderWidth: 2,
-                            pointRadius: 4,
-                            pointHoverRadius: 6
+                            pointRadius: 0,
+                            pointHoverRadius: 0
                         }]
                     },
                     options: {
@@ -94,12 +118,8 @@ HTML_TEMPLATE = """
                                 bodyFont: { family: 'Arial', size: 12 },
                                 padding: 10,
                                 callbacks: {
-                                    label: function(context) {
-                                        return `Температура: ${context.parsed.y}°C`;
-                                    },
-                                    title: function(context) {
-                                        return context[0].label;
-                                    }
+                                    label: context => `Температура: ${context.parsed.y}°C`,
+                                    title: context => context[0].label
                                 }
                             },
                             zoom: {
@@ -145,6 +165,28 @@ HTML_TEMPLATE = """
                     }
                 });
             });
+
+        // Обновление текущей температуры каждые 5 секунд
+        function updateCurrentTemp() {
+            fetch('/current_temp')
+                .then(response => response.json())
+                .then(data => {
+                    const el = document.getElementById('temp-value');
+                    if (data.temp !== null) {
+                        el.textContent = data.temp.toFixed(1);
+                        el.parentElement.classList.remove('text-gray-500');
+                    } else {
+                        el.textContent = '–';
+                        el.parentElement.classList.add('text-gray-500');
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('temp-value').textContent = 'ошибка';
+                });
+        }
+
+        updateCurrentTemp();
+        setInterval(updateCurrentTemp, 5000);
     </script>
 </body>
 </html>
@@ -156,8 +198,13 @@ def index():
 
 @app.route('/data')
 def data():
-    logs = read_logs_last_30_days()
+    logs = read_logs_last_7_days()
     return jsonify(logs)
+
+@app.route('/current_temp')
+def current_temp():
+    temp = get_current_temp()
+    return jsonify({'temp': temp})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=WEB_PORT)
